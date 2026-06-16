@@ -1,0 +1,358 @@
+#!/usr/bin/env python3
+"""Create a small GPCRIGN toy dataset from the full pickle dataset.
+
+The output layout is intentionally simple for a GitHub example:
+
+data/toy_example/
+  label.csv
+  split.csv
+  train/complex/
+  validation/complex/
+  test/complex/
+
+The graph cache folders are created empty and will be filled by train.py or
+predict.py when the example is run.
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import random
+import shutil
+from collections import defaultdict
+from pathlib import Path
+
+
+DEFAULT_PICKLE_ROOT = Path(
+    "/public/home/luoshenggan/qinghua/20260127_6/data/pickle_files"
+)
+DEFAULT_LABEL_CSV = Path("/public/home/luoshenggan/qinghua/20260127_6/label.csv")
+DEFAULT_OUTPUT_DIR = Path("data/toy_example")
+DEFAULT_TARGET = "5HT1A"
+DEFAULT_SAMPLE_SIZE = 200
+DEFAULT_TRAIN_SIZE = 160
+DEFAULT_VALIDATION_SIZE = 20
+DEFAULT_TEST_SIZE = 20
+CLASS_NAMES = {0: "agonist", 1: "antagonist"}
+
+
+def read_labels(label_csv: Path, ligand_column: str, label_column: str) -> tuple[list[str], dict[str, dict[str, str]]]:
+    """Read the full label CSV and return rows keyed by ligand/sample file name."""
+    if not label_csv.is_file():
+        raise FileNotFoundError(f"Label CSV not found: {label_csv}")
+
+    with label_csv.open(newline="", encoding="utf-8-sig") as handle:
+        reader = csv.DictReader(handle)
+        if reader.fieldnames is None:
+            raise ValueError(f"Label CSV is empty: {label_csv}")
+        missing = {ligand_column, label_column}.difference(reader.fieldnames)
+        if missing:
+            raise ValueError(
+                f"Label CSV is missing required column(s): {', '.join(sorted(missing))}"
+            )
+
+        rows: dict[str, dict[str, str]] = {}
+        for row in reader:
+            key = Path(str(row[ligand_column])).name
+            if key in rows:
+                raise ValueError(f"Duplicate ligand key in label CSV: {key}")
+            rows[key] = row
+        return list(reader.fieldnames), rows
+
+
+def normalize_label(value: str) -> int:
+    """Map common label encodings to the integer labels used by GPCRIGN."""
+    text = str(value).strip().lower()
+    if text in {"0", "0.0", "agonist"}:
+        return 0
+    if text in {"1", "1.0", "antagonist"}:
+        return 1
+    raise ValueError(f"Unsupported label value: {value!r}; expected 0/1 or agonist/antagonist.")
+
+
+def candidate_roots(pickle_root: Path, target: str | None) -> list[Path]:
+    """Return source roots to scan for pickle files."""
+    if target:
+        target_root = pickle_root / target
+        roots = [target_root / "agonist", target_root / "antagonist"]
+        existing = [root for root in roots if root.is_dir()]
+        if existing:
+            return existing
+        if target_root.is_dir():
+            return [target_root]
+        raise FileNotFoundError(
+            f"No source directory found for target {target!r} under {pickle_root}"
+        )
+    if not pickle_root.is_dir():
+        raise FileNotFoundError(f"Pickle root not found: {pickle_root}")
+    return [pickle_root]
+
+
+def discover_pickles(roots: list[Path], labeled_rows: dict[str, dict[str, str]]) -> dict[str, Path]:
+    """Find candidate pickle files whose names are present in the label CSV."""
+    samples: dict[str, Path] = {}
+    duplicates: dict[str, list[Path]] = defaultdict(list)
+
+    for root in roots:
+        for path in root.rglob("*"):
+            if not path.is_file() or path.name.startswith("."):
+                continue
+            if path.name not in labeled_rows:
+                continue
+            if path.name in samples:
+                duplicates[path.name].extend([samples[path.name], path])
+            else:
+                samples[path.name] = path
+
+    if duplicates:
+        examples = ", ".join(sorted(duplicates)[:5])
+        raise ValueError(f"Duplicate pickle file names found under source roots: {examples}")
+    if not samples:
+        raise ValueError("No labeled pickle files were found in the selected source roots.")
+    return samples
+
+
+def choose_samples(
+    samples: dict[str, Path],
+    labeled_rows: dict[str, dict[str, str]],
+    label_column: str,
+    sample_size: int,
+    balanced: bool,
+    rng: random.Random,
+) -> list[str]:
+    """Select sample keys from available labeled pickle files."""
+    by_label: dict[int, list[str]] = {0: [], 1: []}
+    for key in samples:
+        label = normalize_label(labeled_rows[key][label_column])
+        by_label[label].append(key)
+
+    for keys in by_label.values():
+        keys.sort()
+
+    if balanced:
+        if sample_size % 2 != 0:
+            raise ValueError("--sample-size must be even when --balanced is used.")
+        per_class = sample_size // 2
+        selected: list[str] = []
+        for label, keys in by_label.items():
+            if len(keys) < per_class:
+                raise ValueError(
+                    f"Not enough {CLASS_NAMES[label]} samples: need {per_class}, found {len(keys)}"
+                )
+            selected.extend(rng.sample(keys, per_class))
+        rng.shuffle(selected)
+        return selected
+
+    keys = sorted(samples)
+    if len(keys) < sample_size:
+        raise ValueError(f"Not enough labeled samples: need {sample_size}, found {len(keys)}")
+    return rng.sample(keys, sample_size)
+
+
+def split_samples(
+    keys: list[str],
+    labeled_rows: dict[str, dict[str, str]],
+    label_column: str,
+    train_size: int,
+    validation_size: int,
+    test_size: int,
+    stratified: bool,
+    rng: random.Random,
+) -> dict[str, list[str]]:
+    """Shuffle and split selected sample keys."""
+    expected = train_size + validation_size + test_size
+    if len(keys) != expected:
+        raise ValueError(
+            f"Split sizes sum to {expected}, but {len(keys)} samples were selected."
+        )
+
+    if stratified:
+        if train_size % 2 or validation_size % 2 or test_size % 2:
+            raise ValueError("Split sizes must be even when balanced stratified splitting is used.")
+        by_label: dict[int, list[str]] = {0: [], 1: []}
+        for key in keys:
+            by_label[normalize_label(labeled_rows[key][label_column])].append(key)
+        for label_keys in by_label.values():
+            rng.shuffle(label_keys)
+
+        split_plan = {
+            "train": train_size // 2,
+            "validation": validation_size // 2,
+            "test": test_size // 2,
+        }
+        splits = {"train": [], "validation": [], "test": []}
+        offsets = {0: 0, 1: 0}
+        for split, per_class in split_plan.items():
+            for label in (0, 1):
+                start = offsets[label]
+                end = start + per_class
+                splits[split].extend(by_label[label][start:end])
+                offsets[label] = end
+            rng.shuffle(splits[split])
+        return splits
+
+    shuffled = list(keys)
+    rng.shuffle(shuffled)
+    train_end = train_size
+    validation_end = train_end + validation_size
+    return {
+        "train": shuffled[:train_end],
+        "validation": shuffled[train_end:validation_end],
+        "test": shuffled[validation_end:],
+    }
+
+
+def prepare_output_dir(output_dir: Path, overwrite: bool) -> None:
+    """Create the toy-example output directory."""
+    if output_dir.exists():
+        if not overwrite:
+            raise FileExistsError(
+                f"Output directory already exists: {output_dir}. Use --overwrite to replace it."
+            )
+        shutil.rmtree(output_dir)
+    for split in ("train", "validation", "test"):
+        for subdir in ("complex", "graph_ls_path", "graph_dic_path"):
+            folder = output_dir / split / subdir
+            folder.mkdir(parents=True, exist_ok=True)
+            (folder / ".gitkeep").touch()
+
+
+def write_outputs(
+    output_dir: Path,
+    splits: dict[str, list[str]],
+    samples: dict[str, Path],
+    label_fields: list[str],
+    labeled_rows: dict[str, dict[str, str]],
+    ligand_column: str,
+    label_column: str,
+) -> None:
+    """Copy pickle files and write filtered labels/split metadata."""
+    selected_keys = [key for split in ("train", "validation", "test") for key in splits[split]]
+
+    for split, keys in splits.items():
+        for key in keys:
+            shutil.copy2(samples[key], output_dir / split / "complex" / key)
+
+    label_csv = output_dir / "label.csv"
+    with label_csv.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=label_fields)
+        writer.writeheader()
+        for key in selected_keys:
+            row = dict(labeled_rows[key])
+            row[ligand_column] = Path(str(row[ligand_column])).name
+            row[label_column] = str(normalize_label(row[label_column]))
+            writer.writerow(row)
+
+    split_csv = output_dir / "split.csv"
+    with split_csv.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=["split", ligand_column, label_column],
+        )
+        writer.writeheader()
+        for split, keys in splits.items():
+            for key in keys:
+                writer.writerow(
+                    {
+                        "split": split,
+                        ligand_column: key,
+                        label_column: normalize_label(labeled_rows[key][label_column]),
+                    }
+                )
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--pickle-root", type=Path, default=DEFAULT_PICKLE_ROOT)
+    parser.add_argument("--label-csv", type=Path, default=DEFAULT_LABEL_CSV)
+    parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
+    parser.add_argument(
+        "--target",
+        default=DEFAULT_TARGET,
+        help="GPCR target folder to sample from, e.g. 5HT1A. Use '' to scan all targets.",
+    )
+    parser.add_argument("--sample-size", type=int, default=DEFAULT_SAMPLE_SIZE)
+    parser.add_argument("--train-size", type=int, default=DEFAULT_TRAIN_SIZE)
+    parser.add_argument("--validation-size", type=int, default=DEFAULT_VALIDATION_SIZE)
+    parser.add_argument("--test-size", type=int, default=DEFAULT_TEST_SIZE)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--ligand-column", default="ligand")
+    parser.add_argument("--label-column", default="label")
+    parser.add_argument(
+        "--unbalanced",
+        action="store_true",
+        help="Sample randomly without forcing a 1:1 agonist/antagonist balance.",
+    )
+    parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Replace the output directory if it already exists.",
+    )
+    return parser
+
+
+def main() -> None:
+    args = build_parser().parse_args()
+    target = args.target if args.target else None
+    rng = random.Random(args.seed)
+
+    expected = args.train_size + args.validation_size + args.test_size
+    if expected != args.sample_size:
+        raise ValueError(
+            f"train/validation/test sizes sum to {expected}, not --sample-size {args.sample_size}."
+        )
+
+    label_fields, labeled_rows = read_labels(
+        args.label_csv,
+        ligand_column=args.ligand_column,
+        label_column=args.label_column,
+    )
+    roots = candidate_roots(args.pickle_root, target)
+    samples = discover_pickles(roots, labeled_rows)
+    selected = choose_samples(
+        samples=samples,
+        labeled_rows=labeled_rows,
+        label_column=args.label_column,
+        sample_size=args.sample_size,
+        balanced=not args.unbalanced,
+        rng=rng,
+    )
+    splits = split_samples(
+        selected,
+        labeled_rows=labeled_rows,
+        label_column=args.label_column,
+        train_size=args.train_size,
+        validation_size=args.validation_size,
+        test_size=args.test_size,
+        stratified=not args.unbalanced,
+        rng=rng,
+    )
+
+    prepare_output_dir(args.output_dir, overwrite=args.overwrite)
+    write_outputs(
+        output_dir=args.output_dir,
+        splits=splits,
+        samples=samples,
+        label_fields=label_fields,
+        labeled_rows=labeled_rows,
+        ligand_column=args.ligand_column,
+        label_column=args.label_column,
+    )
+
+    print(f"[Toy Example] Source roots: {', '.join(str(root) for root in roots)}")
+    print(f"[Toy Example] Output: {args.output_dir}")
+    for split, keys in splits.items():
+        counts = defaultdict(int)
+        for key in keys:
+            counts[normalize_label(labeled_rows[key][args.label_column])] += 1
+        print(
+            f"[Toy Example] {split}: {len(keys)} "
+            f"(agonist={counts[0]}, antagonist={counts[1]})"
+        )
+    print(f"[Toy Example] Labels: {args.output_dir / 'label.csv'}")
+    print(f"[Toy Example] Split map: {args.output_dir / 'split.csv'}")
+
+
+if __name__ == "__main__":
+    main()
