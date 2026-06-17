@@ -4,4 +4,6 @@ __pycache__/
 model_save/
 train_results/
 
+data/full_dataset/
+
 .DS_Store

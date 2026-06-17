@@ -46,8 +46,8 @@ Prediction results are saved to prediction_results/predictions.csv.
 The full dataset is not included. To recreate the toy example from the original local dataset:
 
     python scripts/create_toy_example.py \
-      --pickle-root /public/home/luoshenggan/qinghua/20260127_6/data/pickle_files \
-      --label-csv /public/home/luoshenggan/qinghua/20260127_6/label.csv \
+      --pickle-root ../full_dataset/pickle_files \
+      --label-csv ../full_dataset/label.csv \
       --output-dir data/toy_example \
       --target 5HT1A \
       --overwrite
